@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:weightSum="1">
+
+    <LinearLayout
+        android:orientation="horizontal"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content">
+
+        <CheckBox
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="全选"
+            android:id="@+id/choose_all"
+            android:checked="false" />
+
+        <Button
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="保存"
+            android:id="@+id/save_moniter_list" />
+    </LinearLayout>
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:textAppearance="?android:attr/textAppearanceSmall"
+        android:text="选择需监控文件读写的应用"
+        android:id="@+id/textView2" />
+    <ScrollView
+        android:layout_width="match_parent"
+        android:layout_height="227dp"
+        android:id="@+id/scrollView1">
+        <com.turing.fakeapk.view.FFListView
+            android:layout_width="match_parent"
+            android:layout_height="224dp"
+            android:id="@+id/fileMoniterAppList" />
+    </ScrollView>
+
+    <LinearLayout
+        android:orientation="horizontal"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:weightSum="1">
+
+        <Button
+            style="?android:attr/buttonStyleSmall"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="删除监控文件(默认)"
+            android:id="@+id/delMoniterFile"
+            android:layout_weight="0.41" />
+    </LinearLayout>
+
+    <ScrollView
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:id="@+id/scrollView">
+        <com.turing.fakeapk.view.FFListView
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:id="@+id/beMonitedFileList" />
+    </ScrollView>
+
+
+</LinearLayout>

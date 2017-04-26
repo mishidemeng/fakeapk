@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:weightSum="1">
+
+    <RelativeLayout
+        android:layout_width="match_parent"
+        android:layout_height="match_parent">
+
+        <EditText
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:inputType="textPersonName"
+            android:text="fafa"
+            android:ems="10"
+            android:id="@+id/user_name"
+            android:layout_marginTop="28dp"
+            android:layout_alignParentTop="true"
+            android:layout_centerHorizontal="true" />
+
+        <EditText
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:inputType="numberPassword"
+            android:ems="10"
+            android:id="@+id/password"
+            android:layout_below="@+id/user_name"
+            android:layout_alignLeft="@+id/user_name"
+            android:layout_alignStart="@+id/user_name"
+            android:text="123456" />
+
+        <Button
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="登录"
+            android:id="@+id/btn_login"
+            android:layout_below="@+id/password"
+            android:layout_alignLeft="@+id/password"
+            android:layout_alignStart="@+id/password"
+            android:layout_alignRight="@+id/password"
+            android:layout_alignEnd="@+id/password" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="New Text"
+            android:id="@+id/note"
+            android:layout_below="@+id/btn_login"
+            android:layout_alignParentLeft="true"
+            android:layout_alignParentStart="true"
+            android:layout_marginLeft="22dp"
+            android:layout_marginStart="22dp"
+            android:layout_marginTop="30dp" />
+
+    </RelativeLayout>
+</LinearLayout>

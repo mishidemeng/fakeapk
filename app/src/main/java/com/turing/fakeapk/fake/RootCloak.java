@@ -1,0 +1,942 @@
+package com.turing.fakeapk.fake;
+
+import android.app.ActivityManager;
+import android.app.ActivityManager.RunningAppProcessInfo;
+import android.app.ActivityManager.RunningServiceInfo;
+import android.app.ActivityManager.RunningTaskInfo;
+import android.content.ContentResolver;
+import android.content.pm.ApplicationInfo;
+import android.content.pm.PackageInfo;
+import android.os.Build;
+import android.os.StrictMode;
+import android.provider.Settings;
+import android.text.TextUtils;
+
+import com.turing.fakeapk.Utils.KernelLogUtil;
+import com.turing.fakeapk.Utils.WriteStreamAppend;
+
+import java.io.File;
+import java.io.IOException;
+import java.lang.reflect.Constructor;
+import java.net.URI;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Set;
+
+import de.robv.android.xposed.IXposedHookLoadPackage;
+import de.robv.android.xposed.XC_MethodHook;
+import de.robv.android.xposed.XC_MethodReplacement;
+import de.robv.android.xposed.XposedBridge;
+import de.robv.android.xposed.XposedHelpers;
+import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
+import de.robv.android.xposed.callbacks.XCallback;
+
+import static de.robv.android.xposed.XposedHelpers.findAndHookMethod;
+import static de.robv.android.xposed.XposedHelpers.findConstructorExact;
+
+public class RootCloak implements IXposedHookLoadPackage {
+    private static final String FAKE_COMMAND = "none";
+    private static final String FAKE_FILE = "android";
+    private static final String FAKE_PACKAGE = "com.android.launcher";
+    private static final String FAKE_APPLICATION = "com.android.launcher";
+    private Set<String> appSet;
+    private Set<String> keywordSet;
+    private Set<String> commandSet;
+    private Set<String> libnameSet;
+    private boolean debugPref = true;
+    private boolean isRootCloakLoadingPref = false;
+    private String canGetAllPackAppList;
+    private String mustFilterAppList;
+
+    public void handleLoadPackage(final LoadPackageParam lpparam) throws Throwable {
+        loadPrefs(); // Load prefs for any app. This way we can determine if it matches the list of apps to hide root from.
+//		if (debugPref) {
+//			KernelLogUtil.LogXposed("Found app: " + lpparam.packageName);
+//		}
+        // 白名单 不hook
+        if (appSet.contains(lpparam.packageName)) {
+            return;
+        }
+
+        if (debugPref) {
+            KernelLogUtil.LogXposed("Loaded app: " + lpparam.packageName);
+        }
+
+        // Do all of the hooks
+        initOther(lpparam);
+        initFile(lpparam);
+        initPackageManager(lpparam);
+        initActivityManager(lpparam);
+        initRuntime(lpparam);
+        initProcessBuilder(lpparam);
+        initSettingsGlobal(lpparam);
+        initWriteFile(lpparam);
+        initReadFile(lpparam);
+    }
+
+    /**
+     * Handles a bunch of miscellaneous hooks.
+     *
+     * @param lpparam Wraps information about the app being loaded.
+     */
+    private void initOther(final LoadPackageParam lpparam) {
+        // Always return false when checking if debug is on
+        XposedHelpers.findAndHookMethod("android.os.Debug", lpparam.classLoader, "isDebuggerConnected", XC_MethodReplacement.returnConstant(false));
+
+        // If test-keys, change to release-keys
+        if (!Build.TAGS.equals("release-keys")) {
+            if (debugPref) {
+                KernelLogUtil.LogXposed("Original build tags: " + Build.TAGS);
+            }
+            XposedHelpers.setStaticObjectField(android.os.Build.class, "TAGS", "release-keys");
+            if (debugPref) {
+                KernelLogUtil.LogXposed("New build tags: " + Build.TAGS);
+            }
+        } else {
+            if (debugPref) {
+                KernelLogUtil.LogXposed("No need to change build tags: " + Build.TAGS);
+            }
+        }
+
+        // Tell the app that SELinux is enforcing, even if it is not.
+        XposedHelpers.findAndHookMethod("android.os.SystemProperties", lpparam.classLoader, "get", String.class, new XC_MethodHook() {
+            @Override
+            protected void beforeHookedMethod(XC_MethodHook.MethodHookParam param) throws Throwable {
+                if (((String) param.args[0]).equals("ro.build.selinux")) {
+                    param.setResult("1");
+                    if (debugPref) {
+                        KernelLogUtil.LogXposed("SELinux is enforced.");
+                    }
+                }
+            }
+        });
+
+        // Hide the Xposed classes from the app
+        XposedHelpers.findAndHookMethod("java.lang.Class", lpparam.classLoader, "forName", String.class, boolean.class, ClassLoader.class, new XC_MethodHook() {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                String classname = (String) param.args[0];
+
+                if (classname != null && (classname.equals("de.robv.android.xposed.XposedBridge") || classname.equals("de.robv.android.xposed.XC_MethodReplacement"))) {
+                    param.setThrowable(new ClassNotFoundException());
+                    if (debugPref) {
+                        KernelLogUtil.LogXposed("Found and hid Xposed class name: " + classname);
+                    }
+                }
+            }
+        });
+    }
+
+    private void initReadFile(final LoadPackageParam lpparam) {
+
+        Constructor<?> inputStreamLayoutParams = XposedHelpers.findConstructorExact(java.io.FileInputStream.class, String.class, boolean.class);
+        XposedBridge.hookMethod(inputStreamLayoutParams, new XC_MethodHook(XCallback.PRIORITY_HIGHEST) {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                if (param.args[0] != null) {
+                    if (debugPref) {
+                        KernelLogUtil.LogXposed("initWriteFile: FileOutputStream: " + ((String) param.args[0]));
+                    }
+                }
+            }
+        });
+    }
+
+    private void saveWriteFilePath(String packName, String path) {
+        String pack = SharedPref.getXValue("MonitorPackage");
+        KernelLogUtil.LogXposed("MonitorPackage name: " + pack);
+        String files = pack + ":" + path + "\n";
+        if (null == path || null == pack || path.equals(WriteStreamAppend.mFile)) {
+            return;
+        }
+        //------------------------------------------
+        if (packName.equals(pack)) {
+            WriteStreamAppend.WriteFileAppend(files);
+        }
+    }
+
+    private void initWriteFile(final LoadPackageParam lpparam) {
+        //-----------------------FileOutputStream start----------------------------------------------------------------------------------------------
+        Constructor<?> outputStreamFileLayoutParams = XposedHelpers.findConstructorExact(java.io.FileOutputStream.class, java.io.File.class);
+        XposedBridge.hookMethod(outputStreamFileLayoutParams, new XC_MethodHook(XCallback.PRIORITY_HIGHEST) {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                if (param.args[0] != null) {
+                    if (debugPref) {
+                        KernelLogUtil.LogXposed("initWriteFile: FileOutputStream - file: " + ((File) param.args[0]).getAbsolutePath());
+                    }
+                    saveWriteFilePath(lpparam.packageName, ((File) param.args[0]).getAbsolutePath());
+                }
+            }
+        });
+        Constructor<?> outputStreamFileBooleanLayoutParams = XposedHelpers.findConstructorExact(java.io.FileOutputStream.class, java.io.File.class, boolean.class);
+        XposedBridge.hookMethod(outputStreamFileBooleanLayoutParams, new XC_MethodHook(XCallback.PRIORITY_HIGHEST) {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                if (param.args[0] != null) {
+                    if (debugPref) {
+                        KernelLogUtil.LogXposed("initWriteFile: FileOutputStream - file - boolean: " + ((File) param.args[0]).getAbsolutePath());
+                    }
+                    saveWriteFilePath(lpparam.packageName, ((File) param.args[0]).getAbsolutePath());
+                }
+            }
+        });
+        Constructor<?> outputStreamStringBooleanLayoutParams = XposedHelpers.findConstructorExact(java.io.FileOutputStream.class, String.class, boolean.class);
+        XposedBridge.hookMethod(outputStreamStringBooleanLayoutParams, new XC_MethodHook(XCallback.PRIORITY_HIGHEST) {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                if (param.args[0] != null) {
+                    if (debugPref) {
+                        KernelLogUtil.LogXposed("initWriteFile: FileOutputStream - string - boolean: " + ((String) param.args[0]));
+                    }
+                    saveWriteFilePath(lpparam.packageName, ((String) param.args[0]));
+                }
+            }
+        });
+        //-----------------------FileOutputStream end------------------------------------------------------------------------------------------
+
+        //-----------------------FileWriter start----------------------------------------------------------------------------------------------
+        Constructor<?> fileWriterFileBooleanLayoutParams = XposedHelpers.findConstructorExact(java.io.FileWriter.class, java.io.File.class, boolean.class);
+        XposedBridge.hookMethod(fileWriterFileBooleanLayoutParams, new XC_MethodHook(XCallback.PRIORITY_HIGHEST) {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                if (param.args[0] != null) {
+                    if (debugPref) {
+                        KernelLogUtil.LogXposed("initWriteFile: FileWriter(File,boolean): " + ((File) param.args[0]).getAbsolutePath());
+                    }
+                    saveWriteFilePath(lpparam.packageName, ((File) param.args[0]).getAbsolutePath());
+                }
+            }
+        });
+        Constructor<?> fileWriterFileLayoutParams = XposedHelpers.findConstructorExact(java.io.FileWriter.class, java.io.File.class);
+        XposedBridge.hookMethod(fileWriterFileLayoutParams, new XC_MethodHook(XCallback.PRIORITY_HIGHEST) {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                if (param.args[0] != null) {
+                    if (debugPref) {
+                        KernelLogUtil.LogXposed("initWriteFile: FileWriter(File): " + ((File) param.args[0]).getAbsolutePath());
+                    }
+                    saveWriteFilePath(lpparam.packageName, ((File) param.args[0]).getAbsolutePath());
+                }
+            }
+        });
+        Constructor<?> fileWriterStringLayoutParams = XposedHelpers.findConstructorExact(java.io.FileWriter.class, String.class);
+        XposedBridge.hookMethod(fileWriterStringLayoutParams, new XC_MethodHook(XCallback.PRIORITY_HIGHEST) {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                if (param.args[0] != null) {
+                    if (debugPref) {
+                        KernelLogUtil.LogXposed("initWriteFile: FileWriter(String): " + ((String) param.args[0]));
+                    }
+                    saveWriteFilePath(lpparam.packageName, ((String) param.args[0]));
+                }
+            }
+        });
+        Constructor<?> fileWriterStringBoolLayoutParams = XposedHelpers.findConstructorExact(java.io.FileWriter.class, String.class, boolean.class);
+        XposedBridge.hookMethod(fileWriterStringBoolLayoutParams, new XC_MethodHook(XCallback.PRIORITY_HIGHEST) {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                if (param.args[0] != null) {
+                    if (debugPref) {
+                        KernelLogUtil.LogXposed("initWriteFile: FileWriter(String,boolean): " + ((String) param.args[0]));
+                    }
+                    saveWriteFilePath(lpparam.packageName, ((String) param.args[0]));
+                }
+            }
+        });
+        //-----------------------FileWriter end ----------------------------------------------------------------------------------------------
+        //-----------------------RandomAccessFile start --------------------------------------------------------------------------------------
+        Constructor<?> randomStreamFileLayoutParams = XposedHelpers.findConstructorExact(java.io.RandomAccessFile.class, java.io.File.class, String.class);
+        XposedBridge.hookMethod(randomStreamFileLayoutParams, new XC_MethodHook(XCallback.PRIORITY_HIGHEST) {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                if (param.args[0] != null) {
+                    if (debugPref) {
+                        KernelLogUtil.LogXposed("initWriteFile: RandomAccessFile(File,string): " + ((File) param.args[0]).getAbsolutePath());
+                    }
+                    if (((String) param.args[1]).contains("w") || ((String) param.args[1]).contains("W")) {
+                        saveWriteFilePath(lpparam.packageName, ((File) param.args[0]).getAbsolutePath());
+                    }
+                }
+            }
+        });
+        Constructor<?> randomStreamStringLayoutParams = XposedHelpers.findConstructorExact(java.io.RandomAccessFile.class, String.class, String.class);
+        XposedBridge.hookMethod(randomStreamStringLayoutParams, new XC_MethodHook(XCallback.PRIORITY_HIGHEST) {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                if (param.args[0] != null) {
+                    if (debugPref) {
+                        KernelLogUtil.LogXposed("initWriteFile: RandomAccessFile(string,string): " + ((String) param.args[0]));
+                    }
+                    // 保存写过的文件路径
+                    if (((String) param.args[1]).contains("w") || ((String) param.args[1]).contains("W")) {
+                        saveWriteFilePath(lpparam.packageName, ((String) param.args[0]));
+                    }
+                }
+            }
+        });
+        //-----------------------RandomAccessFile end ----------------------------------------------------------------------------------------
+    }
+
+    /**
+     * Handles all of the hooking related to java.io.File.
+     *
+     * @param lpparam Wraps information about the app being loaded.
+     */
+    private void initFile(final LoadPackageParam lpparam) {
+        /**
+         * Hooks a version of the File constructor.
+         * An app may use File to check for the existence of files like su, busybox, or others.
+         */
+        Constructor<?> constructLayoutParams = XposedHelpers.findConstructorExact(java.io.File.class, String.class);
+        XposedBridge.hookMethod(constructLayoutParams, new XC_MethodHook(XCallback.PRIORITY_HIGHEST) {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                if (param.args[0] != null) {
+                    if (debugPref) {
+                        KernelLogUtil.LogXposed("File: Found a File constructor: " + ((String) param.args[0]));
+                    }
+                }
+                if (isRootCloakLoadingPref) {
+                    // RootCloak is trying to load it's preferences, we shouldn't block this.
+                    return;
+                }
+
+                if (((String) param.args[0]).endsWith("su")) {
+                    if (debugPref) {
+                        KernelLogUtil.LogXposed("File: Found a File constructor ending with su");
+                    }
+                    //param.args[0] = "/system/xbin/" + FAKE_FILE;
+                } else if (((String) param.args[0]).endsWith("busybox")) {
+                    if (debugPref) {
+                        KernelLogUtil.LogXposed("File: Found a File constructor ending with busybox");
+                    }
+                    //param.args[0] = "/system/xbin/" + FAKE_FILE;
+                } else if (stringContainsFromSet(((String) param.args[0]), keywordSet)) {
+                    if (debugPref) {
+                        KernelLogUtil.LogXposed("File: Found a File constructor with word super, noshufou, or chainfire");
+                    }
+                    //param.args[0] = "/system/app/" + FAKE_FILE + ".apk";
+                }
+            }
+        });
+
+        /**
+         * Hooks a version of the File constructor.
+         * An app may use File to check for the existence of files like su, busybox, or others.
+         */
+        Constructor<?> extendedFileConstructor = XposedHelpers.findConstructorExact(java.io.File.class, String.class, String.class);
+        XposedBridge.hookMethod(extendedFileConstructor, new XC_MethodHook(XCallback.PRIORITY_HIGHEST) {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                if (param.args[0] != null && param.args[1] != null) {
+                    if (debugPref) {
+                        KernelLogUtil.LogXposed("File: Found a File constructor: " + ((String) param.args[0]) + ", with: " + ((String) param.args[1]));
+                    }
+                }
+                if (isRootCloakLoadingPref) {
+                    // RootCloak is trying to load it's preferences, we shouldn't block this.
+                    return;
+                }
+
+                if (((String) param.args[1]).equalsIgnoreCase("su")) {
+                    if (debugPref) {
+                        KernelLogUtil.LogXposed("File: Found a File constructor with filename su");
+                    }
+                    //param.args[1] = FAKE_FILE;
+                } else if (((String) param.args[1]).contains("busybox")) {
+                    if (debugPref) {
+                        KernelLogUtil.LogXposed("File: Found a File constructor ending with busybox");
+                    }
+                    //param.args[1] = FAKE_FILE;
+                } else if (stringContainsFromSet(((String) param.args[1]), keywordSet)) {
+                    if (debugPref) {
+                        KernelLogUtil.LogXposed("File: Found a File constructor with word super, noshufou, or chainfire");
+                    }
+                    //param.args[1] = FAKE_FILE + ".apk";
+                }
+            }
+        });
+
+        /**
+         * Hooks a version of the File constructor that uses a URI.
+         * An app may use File to check for the existence of files like su, busybox, or others.
+         * NOTE: Currently just for debugging purposes, not normally used.
+         */
+        Constructor<?> uriFileConstructor = XposedHelpers.findConstructorExact(java.io.File.class, URI.class);
+        XposedBridge.hookMethod(uriFileConstructor, new XC_MethodHook(XCallback.PRIORITY_HIGHEST) {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                if (param.args[0] != null) {
+                    if (debugPref) {
+                        KernelLogUtil.LogXposed("File: Found a URI File constructor: " + ((URI) param.args[0]).toString());
+                    }
+                }
+            }
+        });
+
+
+        /**
+         * Hooks a version of the File constructor that uses a URI.
+         * An app may use File to check for the existence of files like su, busybox, or others.
+         * NOTE: Currently just for debugging purposes, not normally used.
+         */
+        Constructor<?> fileWriterConstructor = XposedHelpers.findConstructorExact(java.io.FileWriter.class, java.io.File.class, boolean.class);
+        XposedBridge.hookMethod(uriFileConstructor, new XC_MethodHook(XCallback.PRIORITY_HIGHEST) {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                if (param.args[0] != null) {
+                    if (debugPref) {
+                        KernelLogUtil.LogXposed("File: Found a FileWriter File constructor: " + ((File) param.args[0]).getPath());
+                    }
+                }
+            }
+        });
+    }
+
+    /**
+     * Handles all of the hooking related to the PackageManager.
+     *
+     * @param lpparam Wraps information about the app being loaded.
+     */
+    private void initPackageManager(final LoadPackageParam lpparam) {
+        /**
+         * Hooks getInstalledApplications within the PackageManager.
+         * An app can check for other apps this way. In the context of a rooted device, an app may look for SuperSU, Xposed, Superuser, or others.
+         * Results that match entries in the keywordSet are hidden.
+         */
+        XposedHelpers.findAndHookMethod("android.app.ApplicationPackageManager", lpparam.classLoader, "getInstalledApplications", int.class, new XC_MethodHook() {
+            @SuppressWarnings("unchecked")
+            @Override
+            protected void afterHookedMethod(MethodHookParam param) throws Throwable { // Hook after getIntalledApplications is called
+                if (debugPref) {
+                    KernelLogUtil.LogXposed("Hooked getInstalledApplications");
+                }
+
+                List<ApplicationInfo> packages = (List<ApplicationInfo>) param.getResult(); // Get the results from the method call
+                Iterator<ApplicationInfo> iter = packages.iterator();
+                ApplicationInfo tempAppInfo;
+                String tempPackageName;
+
+                // Iterate through the list of ApplicationInfo and remove any mentions that match a keyword in the keywordSet
+                while (iter.hasNext()) {
+                    tempAppInfo = iter.next();
+                    tempPackageName = tempAppInfo.packageName;
+                    if (tempPackageName != null && stringContainsFromSet(tempPackageName, keywordSet)) {
+                        iter.remove();
+                        if (debugPref) {
+                            KernelLogUtil.LogXposed("Found and hid package: " + tempPackageName);
+                        }
+                    }
+                }
+
+                param.setResult(packages); // Set the return value to the clean list
+            }
+        });
+
+        /**
+         * Hooks getInstalledPackages within the PackageManager.
+         * An app can check for other apps this way. In the context of a rooted device, an app may look for SuperSU, Xposed, Superuser, or others.
+         * Results that match entries in the keywordSet are hidden.
+         */
+        XposedHelpers.findAndHookMethod("android.app.ApplicationPackageManager", lpparam.classLoader, "getInstalledPackages", int.class, new XC_MethodHook() {
+            @SuppressWarnings("unchecked")
+            @Override
+            protected void afterHookedMethod(MethodHookParam param) throws Throwable { // Hook after getInstalledPackages is called
+                if (debugPref) {
+                    KernelLogUtil.LogXposed("Hooked getInstalledPackages");
+                }
+
+                List<PackageInfo> packages = (List<PackageInfo>) param.getResult(); // Get the results from the method call
+                Iterator<PackageInfo> iter = packages.iterator();
+                PackageInfo tempPackageInfo;
+                String tempPackageName;
+
+                // Iterate through the list of PackageInfo and remove any mentions that match a keyword in the keywordSet
+                while (iter.hasNext()) {
+                    tempPackageInfo = iter.next();
+                    tempPackageName = tempPackageInfo.packageName;
+                    if (tempPackageName != null && stringContainsFromSet(tempPackageName, keywordSet)) {
+                        iter.remove();
+                        if (debugPref) {
+                            KernelLogUtil.LogXposed("Found and hid package: " + tempPackageName);
+                        }
+                    }
+                }
+
+                param.setResult(packages); // Set the return value to the clean list
+            }
+        });
+
+        /**
+         * Hooks getPackageInfo within the PackageManager.
+         * An app can check for other packages this way. We hook before getPackageInfo is called.
+         * If the package being looked at matches an entry in the keywordSet, then substitute a fake package name.
+         * This will ultimately throw a PackageManager.NameNotFoundException.
+         */
+        XposedHelpers.findAndHookMethod("android.app.ApplicationPackageManager", lpparam.classLoader, "getPackageInfo", String.class, int.class, new XC_MethodHook() {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                if (debugPref) {
+                    KernelLogUtil.LogXposed("Hooked getPackageInfo");
+                }
+                String name = (String) param.args[0];
+
+                if (name != null && stringContainsFromSet(name, keywordSet)) {
+                    param.args[0] = FAKE_PACKAGE; // Set a fake package name
+                    if (debugPref) {
+                        KernelLogUtil.LogXposed("Found and hid package: " + name);
+                        KernelLogUtil.LogXposed("Found and hid package used install : " + param.args[0]);
+                    }
+                }
+            }
+        });
+
+        /**
+         * Hooks getApplicationInfo within the PackageManager.
+         * An app can check for other applications this way. We hook before getApplicationInfo is called.
+         * If the application being looked at matches an entry in the keywordSet, then substitute a fake application name.
+         * This will ultimately throw a PackageManager.NameNotFoundException.
+         */
+        XposedHelpers.findAndHookMethod("android.app.ApplicationPackageManager", lpparam.classLoader, "getApplicationInfo", String.class, int.class, new XC_MethodHook() {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+
+                String name = (String) param.args[0];
+                if (debugPref) {
+                    KernelLogUtil.LogXposed("Hooked getApplicationInfo : " + name);
+                }
+
+                if (name != null && stringContainsFromSet(name, keywordSet)) {
+                    param.args[0] = FAKE_APPLICATION; // Set a fake application name
+                    if (debugPref) {
+                        KernelLogUtil.LogXposed("Found and hid application: " + name);
+                        KernelLogUtil.LogXposed("Found and hid application used install : " + param.args[0]);
+                    }
+                }
+            }
+        });
+    }
+
+    /**
+     * Handles all of the hooking related to the ActivityManager.
+     *
+     * @param lpparam Wraps information about the app being loaded.
+     */
+    private void initActivityManager(final LoadPackageParam lpparam) {
+        /**
+         * Hooks getRunningServices within the ActivityManager.
+         * An app can check for other apps this way. In the context of a rooted device, an app may look for SuperSU, Xposed, Superuser, or others.
+         * Results that match entries in the keywordSet are hidden.
+         */
+        XposedHelpers.findAndHookMethod("android.app.ActivityManager", lpparam.classLoader, "getRunningServices", int.class, new XC_MethodHook() {
+            @SuppressWarnings("unchecked")
+            @Override
+            protected void afterHookedMethod(MethodHookParam param) throws Throwable { // Hook after getRunningServices is called
+                if (debugPref) {
+                    KernelLogUtil.LogXposed("Hooked getRunningServices");
+                }
+
+                List<ActivityManager.RunningServiceInfo> services = (List<RunningServiceInfo>) param.getResult(); // Get the results from the method call
+                Iterator<RunningServiceInfo> iter = services.iterator();
+                RunningServiceInfo tempService;
+                String tempProcessName;
+
+                // Iterate through the list of RunningServiceInfo and remove any mentions that match a keyword in the keywordSet
+                while (iter.hasNext()) {
+                    tempService = iter.next();
+                    tempProcessName = tempService.process;
+                    if (tempProcessName != null && stringContainsFromSet(tempProcessName, keywordSet)) {
+                        iter.remove();
+                        if (debugPref) {
+                            KernelLogUtil.LogXposed("Found and hid service: " + tempProcessName);
+                        }
+                    }
+                }
+
+                param.setResult(services); // Set the return value to the clean list
+            }
+        });
+
+        /**
+         * Hooks getRunningTasks within the ActivityManager.
+         * An app can check for other apps this way. In the context of a rooted device, an app may look for SuperSU, Xposed, Superuser, or others.
+         * Results that match entries in the keywordSet are hidden.
+         */
+        XposedHelpers.findAndHookMethod("android.app.ActivityManager", lpparam.classLoader, "getRunningTasks", int.class, new XC_MethodHook() {
+            @SuppressWarnings("unchecked")
+            @Override
+            protected void afterHookedMethod(MethodHookParam param) throws Throwable { // Hook after getRunningTasks is called
+                if (debugPref) {
+                    KernelLogUtil.LogXposed("Hooked getRunningTasks");
+                }
+                List<ActivityManager.RunningTaskInfo> services = (List<RunningTaskInfo>) param.getResult(); // Get the results from the method call
+                Iterator<RunningTaskInfo> iter = services.iterator();
+                RunningTaskInfo tempTask;
+                String tempBaseActivity;
+
+                // Iterate through the list of RunningTaskInfo and remove any mentions that match a keyword in the keywordSet
+                while (iter.hasNext()) {
+                    tempTask = iter.next();
+                    tempBaseActivity = tempTask.baseActivity.flattenToString(); // Need to make it a string for comparison
+                    if (tempBaseActivity != null && stringContainsFromSet(tempBaseActivity, keywordSet)) {
+                        iter.remove();
+                        KernelLogUtil.LogXposed("remove: " + tempBaseActivity);
+                        if (debugPref) {
+                            KernelLogUtil.LogXposed("Found and hid BaseActivity: " + tempBaseActivity);
+                        }
+                    }
+                }
+                param.setResult(services); // Set the return value to the clean list
+            }
+        });
+
+        /**
+         * Hooks getRunningAppProcesses within the ActivityManager.
+         * An app can check for other apps this way. In the context of a rooted device, an app may look for SuperSU, Xposed, Superuser, or others.
+         * Results that match entries in the keywordSet are hidden.
+         */
+        XposedHelpers.findAndHookMethod("android.app.ActivityManager", lpparam.classLoader, "getRunningAppProcesses", new XC_MethodHook() {
+            @SuppressWarnings("unchecked")
+            @Override
+            protected void afterHookedMethod(MethodHookParam param) throws Throwable { // Hook after getRunningAppProcesses is called
+                if (debugPref) {
+                    KernelLogUtil.LogXposed("Hooked getRunningAppProcesses");
+                }
+
+                List<ActivityManager.RunningAppProcessInfo> processes = (List<ActivityManager.RunningAppProcessInfo>) param.getResult(); // Get the results from the method call
+                Iterator<RunningAppProcessInfo> iter = processes.iterator();
+                RunningAppProcessInfo tempProcess;
+                String tempProcessName;
+
+                // Iterate through the list of RunningAppProcessInfo and remove any mentions that match a keyword in the keywordSet
+                while (iter.hasNext()) {
+                    tempProcess = iter.next();
+                    tempProcessName = tempProcess.processName;
+                    if (tempProcessName != null && stringContainsFromSet(tempProcessName, keywordSet)) {
+                        iter.remove();
+                        if (debugPref) {
+                            KernelLogUtil.LogXposed("Found and hid process: " + tempProcessName);
+                        }
+                    }
+                }
+
+                param.setResult(processes); // Set the return value to the clean list
+            }
+        });
+    }
+
+    /**
+     * Handles all of the hooking related to java.lang.Runtime, which is used for executing other programs or shell commands.
+     *
+     * @param lpparam Wraps information about the app being loaded.
+     */
+    private void initRuntime(final LoadPackageParam lpparam) {
+        /**
+         * Hooks exec() within java.lang.Runtime.
+         * This is the only version that needs to be hooked, since all of the others are "convenience" variations.
+         * This takes the form: exec(String[] cmdarray, String[] envp, File dir).
+         * There are a lot of different ways that exec can be used to check for a rooted device. See the comments within this section for more details.
+         */
+        XposedHelpers.findAndHookMethod("java.lang.Runtime", lpparam.classLoader, "exec", String[].class, String[].class, File.class, new XC_MethodHook() {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                if (debugPref) {
+                    KernelLogUtil.LogXposed("Hooked Runtime.exec");
+
+                }
+
+                String[] execArray = (String[]) param.args[0]; // Grab the tokenized array of commands
+                if ((execArray != null) && (execArray.length >= 1)) { // Do some checking so we don't break anything
+                    String firstParam = execArray[0]; // firstParam is going to be the main command/program being run
+                    if (debugPref) { // If debugging is on, print out what is being called
+                        String tempString = "Exec Command:";
+                        for (String temp : execArray) {
+                            tempString = tempString + " " + temp;
+                        }
+                        KernelLogUtil.LogXposed(tempString);
+                    }
+                    if (stringEndsWithFromSet(firstParam, commandSet)) { // Check if the firstParam is one of the keywords we want to filter
+                        if (debugPref) {
+                            KernelLogUtil.LogXposed("Found blacklisted command at the end of the string: " + firstParam);
+                        }
+                        // A bunch of logic follows since the solution depends on which command is being called
+                        // TODO: ***Clean up this logic***
+                        if (firstParam.equals("su") || firstParam.endsWith("/su")) { // If its su or ends with su (/bin/su, /xbin/su, etc)
+                            param.setThrowable(new IOException()); // Throw an exception to imply the command was not found
+                        } else if (commandSet.contains("pm") && (firstParam.equals("pm") || firstParam.endsWith("/pm"))) {
+                            // Trying to run the pm (package manager) using exec. Now let's deal with the subcases
+                            if (execArray.length >= 3 && execArray[1].equalsIgnoreCase("list") && execArray[2].equalsIgnoreCase("packages")) {
+                                // Trying to list out all of the packages, so we will filter out anything that matches the keywords
+                                //param.args[0] = new String[] {"pm", "list", "packages", "-v", "grep", "-v", "\"su\""};
+                                param.args[0] = buildGrepArraySingle(execArray, true);
+                            } else if (execArray.length >= 3 && (execArray[1].equalsIgnoreCase("dump") || execArray[1].equalsIgnoreCase("path"))) {
+                                // Trying to either dump package info or list the path to the APK (both will tell the app that the package exists)
+                                // If it matches anything in the keywordSet, stop it from working by using a fake package name
+                                if (stringContainsFromSet(execArray[2], keywordSet)) {
+                                    param.args[0] = new String[]{execArray[0], execArray[1], FAKE_PACKAGE};
+                                }
+                            }
+                        } else if (commandSet.contains("ps") && (firstParam.equals("ps") || firstParam.endsWith("/ps"))) { // This is a process list command
+                            // Trying to run the ps command to see running processes (e.g. looking for things running as su or daemonsu). Filter this out.
+                            param.args[0] = buildGrepArraySingle(execArray, true);
+                        } else if (commandSet.contains("which") && (firstParam.equals("which") || firstParam.endsWith("/which"))) {
+                            // Busybox "which" command. Thrown an excepton
+                            param.setThrowable(new IOException());
+                        } else if (commandSet.contains("busybox") && anyWordEndingWithKeyword("busybox", execArray)) {
+                            param.setThrowable(new IOException());
+                        } else if (commandSet.contains("sh") && (firstParam.equals("sh") || firstParam.endsWith("/sh"))) {
+                            param.setThrowable(new IOException());
+                        } else {
+                            param.setThrowable(new IOException());
+                        }
+
+                        if (debugPref && param.getThrowable() == null) { // Print out the new command if debugging is on
+                            String tempString = "New Exec Command:";
+                            for (String temp : (String[]) param.args[0]) {
+                                tempString = tempString + " " + temp;
+                            }
+                            KernelLogUtil.LogXposed(tempString);
+                        }
+                    }
+
+
+                } else {
+                    if (debugPref) {
+                        KernelLogUtil.LogXposed("Null or empty array on exec");
+                    }
+                }
+            }
+        });
+
+        /**
+         * Hooks loadLibrary() within java.lang.Runtime.
+         * There are libraries specifically built to check for root. This helps us block those and others.
+         */
+        XposedHelpers.findAndHookMethod("java.lang.Runtime", lpparam.classLoader, "loadLibrary", String.class, ClassLoader.class, new XC_MethodHook() {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                if (debugPref) {
+                    KernelLogUtil.LogXposed("Hooked loadLibrary");
+                }
+                String libname = (String) param.args[0];
+
+                if (libname != null && stringContainsFromSet(libname, libnameSet)) { // If we found one of the libraries we block, let's prevent it from being loaded
+                    param.setResult(null);
+                    if (debugPref) {
+                        KernelLogUtil.LogXposed("Loading of library " + libname + " disabled.");
+                    }
+                }
+            }
+        });
+    }
+
+    private void initProcessBuilder(final LoadPackageParam lpparam) {
+        // Hook ProcessBuilder and prevent running of certain commands
+        Constructor<?> processBuilderConstructor2 = XposedHelpers.findConstructorExact(java.lang.ProcessBuilder.class, String[].class);
+        XposedBridge.hookMethod(processBuilderConstructor2, new XC_MethodHook(XCallback.PRIORITY_HIGHEST) {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                KernelLogUtil.LogXposed("Hooked ProcessBuilder");
+                if (param.args[0] != null) {
+                    String[] cmdArray = (String[]) param.args[0];
+                    if (debugPref) {
+                        String tempString = "ProcessBuilder Command:";
+                        for (String temp : cmdArray) {
+                            tempString = tempString + " " + temp;
+                        }
+                        KernelLogUtil.LogXposed(tempString);
+                    }
+                    if (stringEndsWithFromSet(cmdArray[0], commandSet)) {
+                        cmdArray[0] = FAKE_COMMAND;
+                        param.args[0] = cmdArray;
+                    }
+
+                    if (debugPref) {
+                        String tempString = "New ProcessBuilder Command:";
+                        for (String temp : (String[]) param.args[0]) {
+                            tempString = tempString + " " + temp;
+                        }
+                        KernelLogUtil.LogXposed(tempString);
+                    }
+                }
+            }
+        });
+    }
+
+    /**
+     * Hooks for the device settings.
+     */
+    private void initSettingsGlobal(final LoadPackageParam lpparam) {
+        // Hooks Settings.Global.getInt. For this method we will prevent the package info from being obtained for any app in the list
+        XposedHelpers.findAndHookMethod(Settings.Global.class, "getInt", ContentResolver.class, String.class, int.class, new XC_MethodHook() {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+
+                String setting = (String) param.args[1];
+                if (setting != null && Settings.Global.ADB_ENABLED.equals(setting)) { // Hide ADB being on from an app
+                    param.setResult(0);
+                    if (debugPref) {
+                        KernelLogUtil.LogXposed("Hooked ADB debugging info, adb status is off");
+                    }
+                }
+            }
+        });
+    }
+
+    /**
+     * Load all preferences, such as keywords, commands, etc.
+     */
+    public void loadPrefs() {
+        StrictMode.ThreadPolicy old = StrictMode.getThreadPolicy();
+        StrictMode.setThreadPolicy(new StrictMode.ThreadPolicy.Builder(old)
+                .permitDiskReads()
+                .permitDiskWrites()
+                .build());
+
+        isRootCloakLoadingPref = true;
+
+        try {
+
+            keywordSet = new HashSet<String>();
+            commandSet = new HashSet<String>();
+            libnameSet = new HashSet<String>();
+
+            keywordSet.isEmpty();
+            commandSet.isEmpty();
+            libnameSet.isEmpty();
+
+            canGetAllPackAppList = SharedPref.getXValue("CanGetAllPackgeAppList");
+            mustFilterAppList = SharedPref.getXValue("MustFiterKeyWordList");
+
+            KernelLogUtil.LogXposed("loadPrefs canGetAllPackAppList:" + canGetAllPackAppList);
+            KernelLogUtil.LogXposed("loadPrefs mustFilterAppList:" + mustFilterAppList);
+            if (canGetAllPackAppList != null) {
+                appSet = new HashSet<String>(getAppset(canGetAllPackAppList));
+                KernelLogUtil.LogXposed("loadPrefs appSet.size:" + appSet.size());
+            } else {
+                appSet = Common.DEFAULT_APPS_SET;
+            }
+            if (mustFilterAppList != null) {
+                keywordSet = new HashSet<String>(getAppset(mustFilterAppList));
+                KernelLogUtil.LogXposed("loadPrefs keywordSet.size:" + keywordSet.size());
+            } else {
+                if (keywordSet.isEmpty()) {
+                    keywordSet = Common.DEFAULT_KEYWORD_SET;
+                }
+            }
+
+            if (commandSet.isEmpty()) {
+                commandSet = Common.DEFAULT_COMMAND_SET;
+            }
+            if (libnameSet.isEmpty()) {
+                libnameSet = Common.DEFAULT_LIBNAME_SET;
+            }
+        } finally {
+            StrictMode.setThreadPolicy(old);
+
+            isRootCloakLoadingPref = false;
+        }
+
+    }
+
+    public static List<String> getAppset(String parramString) {
+        if (TextUtils.isEmpty(parramString)) {
+            return null;
+        }
+        return Arrays.asList(TextUtils.split(parramString.replace(" ", ""), ","));
+    }
+
+    /* ********************
+     * Helper method section
+     * ********************/
+
+    // TODO: Clean up these helper methods?
+
+    /**
+     * Takes a keyword string and an array of strings, and checks to see if any values in the array end with the keyword
+     *
+     * @param keyword
+     * @param wordArray
+     * @return boolean indicating if any value from the array ends in the keyword
+     */
+    private Boolean anyWordEndingWithKeyword(String keyword, String[] wordArray) {
+        for (String tempString : wordArray) {
+            if (tempString.endsWith(keyword)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Takes a string and a set of strings, and checks to see if the base string contains any of the values from the set.
+     *
+     * @param base   a string that we want to check the contents of
+     * @param values a set of strings to check the base for
+     * @return boolean indicating if the string contains any value from the set of strings
+     */
+    public boolean stringContainsFromSet(String base, Set<String> values) {
+        if (base != null && values != null) {
+            for (String tempString : values) {
+                if (base.matches(".*(\\W|^)" + tempString + "(\\W|$).*")) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Takes a string and a set of strings, and checks to see if the base string ends with any of the values from the set.
+     *
+     * @param base   a string that we check the end of
+     * @param values a set of strings to check the end of the base for
+     * @return boolean indicating if the string ends with any value from the set of strings
+     */
+    public boolean stringEndsWithFromSet(String base, Set<String> values) {
+        if (base != null && values != null) {
+            for (String tempString : values) {
+                if (base.endsWith(tempString)) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * This helper takes a command and appends a lot of greps to it. The idea is to filter out anything that matches the keywordSet.
+     *
+     * @param original the original command array
+     * @param addSH    whether or not to add sh -c to the command array
+     * @return a new String array that has the grep filtering added
+     */
+    private String[] buildGrepArraySingle(String[] original, boolean addSH) {
+        StringBuilder builder = new StringBuilder();
+        ArrayList<String> originalList = new ArrayList<String>();
+        if (addSH) {
+            originalList.add("sh");
+            originalList.add("-c");
+        }
+        for (String temp : original) {
+            builder.append(" ");
+            builder.append(temp);
+        }
+        //originalList.addAll(Arrays.asList(original));
+        // ***TODO: Switch to using -e with alternation***
+        for (String temp : keywordSet) {
+            builder.append(" | grep -v ");
+            builder.append(temp);
+        }
+        //originalList.addAll(Common.DEFAULT_GREP_ENTRIES);
+        originalList.add(builder.toString());
+        return originalList.toArray(new String[0]);
+    }
+
+}
